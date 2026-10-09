@@ -35,11 +35,14 @@ jobs:
             "build-tools;34.0.0" \
             "ndk;28.2.13676358" \
             "cmake;3.22.1"
+          ndk_dir="${ANDROID_SDK_ROOT}/ndk/28.2.13676358"
+          cmake_bin="${ANDROID_SDK_ROOT}/cmake/3.22.1/bin"
+          test -x "${ndk_dir}/ndk-build"
+          test -x "${cmake_bin}/cmake"
+          printf 'ANDROID_NDK=%s\n' "${ndk_dir}" >> "${GITHUB_ENV}"
+          printf '%s\n' "${cmake_bin}" >> "${GITHUB_PATH}"
 
       - name: Build and verify APK
-        env:
-          ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/28.2.13676358
-          PATH: ${{ env.ANDROID_SDK_ROOT }}/cmake/3.22.1/bin:${{ env.PATH }}
         run: ./scripts/build-swahili-tts-apk.sh
 
       - name: Upload debug APK and checksum

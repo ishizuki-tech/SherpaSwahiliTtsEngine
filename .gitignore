@@ -1,0 +1,4 @@
+.build/
+artifacts/
+*.apk
+*.apk.sha256

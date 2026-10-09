@@ -2,6 +2,12 @@ name: Build Swahili TTS Engine APK
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_prerelease:
+        description: "Publish a public test Pre-release after a successful build"
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
@@ -55,3 +61,129 @@ jobs:
           path: |
             artifacts/SherpaSwahiliTtsEngine-v1.13.1-arm64-v8a-debug.apk
             artifacts/SherpaSwahiliTtsEngine-v1.13.1-arm64-v8a-debug.apk.sha256
+
+  publish-prerelease:
+    name: Publish test Pre-release
+    needs: build-apk
+    if: ${{ github.ref == 'refs/heads/main' && inputs.publish_prerelease == true }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the built source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require documented model redistribution authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          authorization_file="docs/model-redistribution-authorization.md"
+          test -f "${authorization_file}"
+          grep -qx 'PUBLIC_REDISTRIBUTION_AUTHORIZED=true' "${authorization_file}" || {
+            echo "::error::Public model redistribution is not authorized by ${authorization_file}."
+            exit 1
+          }
+          authorization_reference="$(sed -n 's/^PUBLIC_REDISTRIBUTION_AUTHORIZATION_REFERENCE=//p' "${authorization_file}")"
+          test -n "${authorization_reference}"
+          test "${authorization_reference}" != "UNRESOLVED"
+
+      - name: Download APK build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sherpa-swahili-tts-engine-debug-arm64-v8a
+          path: release-assets
+
+      - name: Validate artifacts and publish Pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          apk_name="SherpaSwahiliTtsEngine-v1.13.1-arm64-v8a-debug.apk"
+          apk_path="release-assets/${apk_name}"
+          checksum_path="${apk_path}.sha256"
+          short_sha="${GITHUB_SHA::7}"
+          release_tag="test-build-${GITHUB_RUN_NUMBER}-${short_sha}"
+          qr_name="${apk_name%.apk}-qr.png"
+          qr_path="release-assets/${qr_name}"
+          apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${apk_name}"
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          test -s "${apk_path}"
+          test -s "${checksum_path}"
+          expected_sha256="$(awk '{print $1}' "${checksum_path}")"
+          checksum_filename="$(awk '{print $2}' "${checksum_path}")"
+          actual_sha256="$(sha256sum "${apk_path}" | awk '{print $1}')"
+          [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${checksum_filename}" == "${apk_name}" ]]
+          [[ "${actual_sha256}" == "${expected_sha256}" ]]
+          unzip -t "${apk_path}" >/dev/null
+
+          require_remote_absent() {
+            local endpoint="$1"
+            local resource_name="$2"
+            local response_file
+            local lookup_status
+            response_file="$(mktemp)"
+            if gh api --include "${endpoint}" >"${response_file}" 2>&1; then
+              cat "${response_file}" >&2
+              rm -f "${response_file}"
+              echo "::error::Refusing to reuse existing ${resource_name}: ${release_tag}" >&2
+              return 1
+            else
+              lookup_status=$?
+            fi
+            if grep -Eq '(^HTTP/[0-9.]+ 404( |$)|HTTP 404)' "${response_file}"; then
+              rm -f "${response_file}"
+              return 0
+            fi
+            cat "${response_file}" >&2
+            rm -f "${response_file}"
+            echo "::error::Could not determine whether ${resource_name} ${release_tag} exists (gh api exit ${lookup_status})." >&2
+            return 1
+          }
+
+          require_remote_absent "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" "GitHub Release"
+          require_remote_absent "repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}" "Git tag"
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qrencode zbar-tools
+          qrencode --type PNG --size 10 --margin 4 --output "${qr_path}" "${apk_url}"
+          test -s "${qr_path}"
+          test "$(file --brief --mime-type "${qr_path}")" = "image/png"
+          zbarimg --quiet --raw "${qr_path}" | grep -Fx "${apk_url}"
+
+          cat > release-notes.md <<EOF
+          ## Swahili TTS Engine test build
+
+          - APK: [${apk_name}](${apk_url})
+          - SHA-256: `${actual_sha256}`
+          - Source commit: `${GITHUB_SHA}`
+          - Workflow run: [${GITHUB_RUN_ID}](${run_url})
+
+          This APK is debug-signed for test distribution only. It is not release-signed and must not be treated as a production distribution.
+
+          Scan this QR code to download the APK directly:
+
+          ![QR code for ${apk_name}](${apk_url%/*}/${qr_name})
+          EOF
+
+          gh release create "${release_tag}" \
+            "${apk_path}" "${checksum_path}" "${qr_path}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Swahili TTS Engine test build ${release_tag}" \
+            --notes-file release-notes.md \
+            --prerelease
+
+          release_json="$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isPrerelease,targetCommitish,assets,url)"
+          jq -e --arg commit "${GITHUB_SHA}" --arg apk "${apk_name}" --arg checksum "${apk_name}.sha256" --arg qr "${qr_name}" '
+            .isPrerelease == true
+            and .targetCommitish == $commit
+            and (([.assets[].name] | sort) == ([$apk, $checksum, $qr] | sort))
+          ' <<<"${release_json}" >/dev/null
